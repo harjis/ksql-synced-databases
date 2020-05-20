@@ -5,72 +5,150 @@ docker-compose up
 
 Create customers & orders dbs:
 ```shell script
-docker exec -it postgres psql -U postgres-user
-
-create database customers;
-create database orders;
-\c customers;
-CREATE TABLE customers (id TEXT PRIMARY KEY, name TEXT, age INT);
+docker-compose exec postgres bash -c 'psql -U postgres-user -f /usr/initialize.sql'
 ```
 
-Create customer data:
-```sql
-INSERT INTO customers (id, name, age) VALUES ('5', 'fred', 34);
-INSERT INTO customers (id, name, age) VALUES ('7', 'sue', 25);
-INSERT INTO customers (id, name, age) VALUES ('2', 'bill', 51);
-```
-
-Start postgres & mongo debezium source connnectors:
 ```shell script
-docker exec -it ksqldb-cli ksql http://ksqldb-server:8088
-SET 'auto.offset.reset' = 'earliest';
+# Start SINK connector
+curl -i -X POST -H "Accept:application/json" -H  "Content-Type:application/json" http://localhost:8083/connectors/ -d @jdbc-sink.json
+
+# Start SOURCE connector
+curl -i -X POST -H "Accept:application/json" -H  "Content-Type:application/json" http://localhost:8083/connectors/ -d @source.json
 ```
 
-```sql
-CREATE SOURCE CONNECTOR customers_reader WITH (
-    'connector.class' = 'io.debezium.connector.postgresql.PostgresConnector',
-    'database.hostname' = 'postgres',
-    'database.port' = '5432',
-    'database.user' = 'postgres-user',
-    'database.password' = 'postgres-pw',
-    'database.dbname' = 'customers',
-    'database.server.name' = 'customers',
-    'table.whitelist' = 'public.customers',
-    'transforms' = 'unwrap',
-    'transforms.unwrap.type' = 'io.debezium.transforms.ExtractNewRecordState',
-    'transforms.unwrap.drop.tombstones' = 'false',
-    'transforms.unwrap.delete.handling.mode' = 'rewrite'
-);
-
-CREATE STREAM customers WITH (
-    kafka_topic = 'customers.public.customers',
-    value_format = 'avro'
-);
-
-CREATE STREAM t_customers WITH (
-    kafka_topic = 't_customers'
-)   AS
-    SELECT  c.id,
-            c.name,
-            c.age
-    FROM customers c
-    EMIT CHANGES;
+Check contents of the SOURCE database:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user customers -c "select * from customers"'
+ id | name | age
+----+------+-----
+  1 | fred |  34
+  2 | sue  |  25
+  3 | bill |  51
+(3 rows)
 ```
 
-Create sink connector:
-```sql
-CREATE SINK CONNECTOR customers_writer WITH (
-    'connector.class' = 'io.confluent.connect.jdbc.JdbcSinkConnector',
-    'topics' = 't_customers',
-    'connection.url' = 'jdbc:postgresql://postgres:5432/orders',
-    'connection.user' = 'postgres-user',
-    'connection.password' = 'postgres-pw',
-    'dialect.name' = 'PostgreSqlDatabaseDialect',
-    'insert.mode' = 'upsert',
-    'delete.enabled' = 'true',
-    'pk.mode' = 'record_key',
-    'pk.fields' = 'id',
-    'auto.create' = 'true',
-    'auto.evolve' = 'true'
-);
+Verify that the SINK database has the same content:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user orders -c "select * from customers"'
+  name | id | age
+ ------+----+-----
+  fred |  1 |  34
+  sue  |  2 |  25
+  bill |  3 |  51
+ (3 rows)
+```
+
+Insert a new row in SOURCE db:
+```shell script
+docker-compose exec postgres psql -U postgres-user customers -c "INSERT INTO customers (id, name, age) VALUES (4, 'New Customer', 35);"
+```
+
+Check contents of the SOURCE database:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user customers -c "select * from customers"'
+  id |     name     | age
+ ----+--------------+-----
+   1 | fred         |  34
+   2 | sue          |  25
+   3 | bill         |  51
+   4 | New Customer |  35
+ (4 rows)
+```
+
+Verify that the SINK database has the same content:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user orders -c "select * from customers"'
+     name     | id | age
+--------------+----+-----
+ fred         |  1 |  34
+ sue          |  2 |  25
+ bill         |  3 |  51
+ New Customer |  4 |  35
+(4 rows)
+```
+
+Update a row in SOURCE db:
+```shell script
+docker-compose exec postgres psql -U postgres-user customers -c "UPDATE customers SET name='Not fred' WHERE id = 1;"
+```
+
+Check contents of the SOURCE database:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user customers -c "select * from customers"'
+ id |     name     | age
+----+--------------+-----
+  2 | sue          |  25
+  3 | bill         |  51
+  4 | New Customer |  35
+  1 | Not fred     |  34
+(4 rows)
+```
+
+Verify that the SINK database has the same content:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user orders -c "select * from customers"'
+     name     | id | age
+--------------+----+-----
+ sue          |  2 |  25
+ bill         |  3 |  51
+ New Customer |  4 |  35
+ Not fred     |  1 |  34
+(4 rows)
+```
+
+Delete a row in SOURCE db:
+```shell script
+docker-compose exec postgres psql -U postgres-user customers -c "DELETE FROM customers WHERE id = 2;"
+```
+
+Check contents of the SOURCE database:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user customers -c "select * from customers"'
+ id |     name     | age
+----+--------------+-----
+  3 | bill         |  51
+  4 | New Customer |  35
+  1 | Not fred     |  34
+(3 rows)
+```
+
+Verify that the SINK database has the same content:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user orders -c "select * from customers"'
+     name     | id | age
+--------------+----+-----
+ bill         |  3 |  51
+ New Customer |  4 |  35
+ Not fred     |  1 |  34
+(3 rows)
+```
+
+Create a foreign key dependency on SINK database:
+```shell script
+docker-compose exec postgres bash -c 'psql -U postgres-user -f /usr/foreign-key-dependency.sql'
+```
+
+Verify that the SINK database has orders:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user orders -c "select * from orders"'
+ id |  name   | customer_id
+----+---------+-------------
+  1 | order 1 |           1
+  2 | order 2 |           1
+  3 | order 3 |           3
+(3 rows)
+```
+
+Delete row id 1 in SOURCE db:
+```shell script
+docker-compose exec postgres psql -U postgres-user customers -c "DELETE FROM customers WHERE id = 1;"
+```
+
+Verify that the SINK database does not have orders for customer 1:
+```shell
+docker-compose exec postgres bash -c 'psql -U postgres-user orders -c "select * from orders"'
+ id |  name   | customer_id
+----+---------+-------------
+  3 | order 3 |           3
+(1 row)
 ```
